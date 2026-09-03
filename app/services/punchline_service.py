@@ -1,3 +1,5 @@
+from typing import Any, Dict, List
+
 from fastapi import BackgroundTasks
 from pymongo.errors import DuplicateKeyError
 
@@ -21,27 +23,51 @@ SIMILARITY_THRESHOLD = 0.75
 VECTOR_SEARCH_LIMIT = 5
 
 
-# ======================================================
-# Background Task
+# ==========================================================
+# HELPER
+# ==========================================================
+
+def serialize_dialogue(document: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert MongoDB dialogue document into a safe object
+    that can be passed to Gemini.
+    """
+
+    return {
+        "id": str(document.get("_id")),
+        "movie_id": document.get("movie_id"),
+        "actor_id": document.get("actor_id"),
+        "character": document.get("character"),
+        "dialogue": document.get("dialogue"),
+        "preference": document.get("preference"),
+        "criteria": document.get("criteria"),
+        "is_default": document.get("is_default", False)
+    }
+
+
+# ==========================================================
+# BACKGROUND GENERATION
 #
-# GEMINI CALL 1
-#     ->
-# Actual movie punchline
+# CALL 1
+#   Mongo candidates + movie context + preferences
+#       ->
+#   Best movie dialogue
 #
-# GEMINI CALL 2
-#     ->
-# DIG + movie punchline
+# CALL 2
+#   Same context + preferences + selected dialogue
+#       ->
+#   Personalized DIG + dialogue
 #
-#     ->
-# Store final response in MongoDB
-# ======================================================
+#       ->
+#   Store in MongoDB
+# ==========================================================
 
 def generate_and_store_punchline(
     movie_id: str,
     actor_id: str,
-    genres: list,
-    user_preferences: dict,
-    context: dict
+    genres: List[str],
+    user_preferences: Dict[str, Any],
+    context: Dict[str, Any]
 ):
 
     print(
@@ -51,9 +77,9 @@ def generate_and_store_punchline(
 
     try:
 
-        # --------------------------------------------------
+        # ==================================================
         # 1. Build criteria and preference vector
-        # --------------------------------------------------
+        # ==================================================
 
         criteria, preference_vector, vector_dimensions = (
             build_preference_vector(
@@ -62,9 +88,13 @@ def generate_and_store_punchline(
             )
         )
 
-        # --------------------------------------------------
+        print(
+            f"[BACKGROUND] Criteria: {criteria}"
+        )
+
+        # ==================================================
         # 2. Build profile key
-        # --------------------------------------------------
+        # ==================================================
 
         profile_key = build_profile_key(
             movie_id=movie_id,
@@ -73,9 +103,13 @@ def generate_and_store_punchline(
             criteria=criteria
         )
 
-        # --------------------------------------------------
-        # 3. Check duplicate
-        # --------------------------------------------------
+        print(
+            f"[BACKGROUND] Profile key: {profile_key}"
+        )
+
+        # ==================================================
+        # 3. Check duplicate generation
+        # ==================================================
 
         existing = punchlines_collection.find_one(
             {
@@ -86,43 +120,104 @@ def generate_and_store_punchline(
         if existing:
 
             print(
-                f"[BACKGROUND] Skipped - "
-                f"profile already exists: "
-                f"{profile_key}"
+                "[BACKGROUND] Skipped - "
+                f"profile already exists: {profile_key}"
             )
 
             return
 
         # ==================================================
+        # 4. Get available movie dialogues
+        #
+        # IMPORTANT:
+        # Gemini cannot know what exists in MongoDB.
+        # We explicitly pass the available candidates.
+        # ==================================================
+
+        raw_dialogues = list(
+            movie_dialogues_collection.find(
+                {
+                    "movie_id": movie_id,
+                    "actor_id": actor_id
+                }
+            )
+        )
+
+        available_dialogues = [
+            serialize_dialogue(d)
+            for d in raw_dialogues
+            if d.get("dialogue")
+        ]
+
+        print(
+            "[BACKGROUND] Available dialogues: "
+            f"{len(available_dialogues)}"
+        )
+
+        # ==================================================
+        # 5. Get default dialogue
+        # ==================================================
+
+        default_dialogue_document = (
+            movie_dialogues_collection.find_one(
+                {
+                    "movie_id": movie_id,
+                    "is_default": True
+                }
+            )
+        )
+
+        default_dialogue = None
+
+        if default_dialogue_document:
+
+            default_dialogue = serialize_dialogue(
+                default_dialogue_document
+            )
+
+            print(
+                "[BACKGROUND] Default dialogue found."
+            )
+
+        else:
+
+            print(
+                "[BACKGROUND] No default dialogue found."
+            )
+
+        # ==================================================
         # GEMINI CALL 1
         #
-        # Generate/select the movie punchline.
+        # Select the best available actual dialogue.
         #
-        # This does NOT come from MongoDB.
-        # Gemini receives:
-        # - movie
-        # - actor
-        # - character
-        # - genres
-        # - user preferences
+        # Preference order:
+        #
+        # highest weight
+        #       ↓
+        # next highest
+        #       ↓
+        # ...
+        #       ↓
+        # default dialogue
         # ==================================================
 
         print(
-            "[BACKGROUND] Generating Gemini "
-            "movie punchline..."
+            "[BACKGROUND] Starting Gemini Call 1..."
         )
 
         try:
 
             movie_punchline = generate_movie_punchline(
                 context=context,
-                criteria=criteria
+                criteria=criteria,
+                available_dialogues=available_dialogues,
+                default_dialogue=default_dialogue
             )
 
         except Exception as e:
 
             print(
-                f"[BACKGROUND] Gemini Call 1 FAILED: "
+                "[BACKGROUND] Gemini Call 1 FAILED: "
                 f"{movie_id} / {actor_id}"
             )
 
@@ -135,14 +230,19 @@ def generate_and_store_punchline(
         if not movie_punchline:
 
             print(
-                f"[BACKGROUND] Empty movie punchline: "
+                "[BACKGROUND] Empty movie punchline: "
                 f"{movie_id} / {actor_id}"
             )
 
             return
 
         print(
-            "[BACKGROUND] Movie punchline generated."
+            "[BACKGROUND] Gemini Call 1 completed."
+        )
+
+        print(
+            f"[BACKGROUND] Selected dialogue: "
+            f"{movie_punchline}"
         )
 
         # ==================================================
@@ -150,20 +250,13 @@ def generate_and_store_punchline(
         #
         # Generate:
         #
-        # DIG + ACTUAL MOVIE PUNCHLINE
-        #
-        # Gemini Call 2 receives:
-        # - movie
-        # - actor
-        # - character
-        # - genres
-        # - user preferences
-        # - punchline from Gemini Call 1
+        # Personalized DIG
+        #       +
+        # Selected actual movie dialogue
         # ==================================================
 
         print(
-            "[BACKGROUND] Generating Gemini "
-            "contextual response..."
+            "[BACKGROUND] Starting Gemini Call 2..."
         )
 
         try:
@@ -177,7 +270,7 @@ def generate_and_store_punchline(
         except Exception as e:
 
             print(
-                f"[BACKGROUND] Gemini Call 2 FAILED: "
+                "[BACKGROUND] Gemini Call 2 FAILED: "
                 f"{movie_id} / {actor_id}"
             )
 
@@ -187,55 +280,56 @@ def generate_and_store_punchline(
 
             return
 
-        # --------------------------------------------------
-        # 6. Validate final response
-        # --------------------------------------------------
-
         if not final_response:
 
             print(
-                f"[BACKGROUND] Empty final response: "
+                "[BACKGROUND] Empty final response: "
                 f"{movie_id} / {actor_id}"
             )
 
             return
 
         print(
-            "[BACKGROUND] Final response generated."
+            "[BACKGROUND] Gemini Call 2 completed."
         )
 
         # ==================================================
-        # 7. Prepare MongoDB document
+        # 6. Prepare MongoDB document
         # ==================================================
 
         document = {
+
             "movie_id": movie_id,
+
             "actor_id": actor_id,
 
-            # IMPORTANT:
-            # Save the character received in the request.
-            "character": context.get("character"),
+            "character": context.get(
+                "character"
+            ),
 
             "genres": genres,
+
             "criteria": criteria,
 
             "preference_vector": preference_vector,
+
             "vector_dimensions": vector_dimensions,
+
             "profile_key": profile_key,
 
-            # Gemini 1 result.
+            # Selected actual movie dialogue
             "movie_punchline": movie_punchline,
 
-            # Gemini 2 result.
-            # This is the final DIG + punchline.
+            # Final DIG + dialogue
             "response": final_response,
 
             "source": "gemini",
+
             "generation_status": "completed"
         }
 
         # ==================================================
-        # 8. Store generated response
+        # 7. Store generated response
         # ==================================================
 
         try:
@@ -245,14 +339,14 @@ def generate_and_store_punchline(
             )
 
             print(
-                f"[BACKGROUND] Successfully stored: "
+                "[BACKGROUND] Successfully stored: "
                 f"{movie_id} / {actor_id}"
             )
 
         except DuplicateKeyError:
 
             print(
-                f"[BACKGROUND] Duplicate prevented: "
+                "[BACKGROUND] Duplicate prevented: "
                 f"{profile_key}"
             )
 
@@ -261,7 +355,7 @@ def generate_and_store_punchline(
     except Exception as e:
 
         print(
-            f"[BACKGROUND] FAILED: "
+            "[BACKGROUND] FAILED: "
             f"{movie_id} / {actor_id}"
         )
 
@@ -270,76 +364,27 @@ def generate_and_store_punchline(
         )
 
 
-# ======================================================
-# Main Punchline Service
-# ======================================================
+# ==========================================================
+# MAIN PUNCHLINE SERVICE
+# ==========================================================
 
 def get_punchline(
     movie_id: str,
     actor_id: str,
-    genres: list,
-    user_preferences: dict,
-    context: dict,
+    genres: List[str],
+    user_preferences: Dict[str, Any],
+    context: Dict[str, Any],
     background_tasks: BackgroundTasks
 ):
 
-    # --------------------------------------------------
-    # 1. Check whether actor belongs to the movie
-    # --------------------------------------------------
-
-    actor_in_movie = movie_dialogues_collection.find_one(
-        {
-            "movie_id": movie_id,
-            "actor_id": actor_id
-        }
+    print(
+        f"[SERVICE] Request: "
+        f"{movie_id} / {actor_id}"
     )
 
-    # --------------------------------------------------
-    # 2. Actor NOT in movie
-    # --------------------------------------------------
-
-    if not actor_in_movie:
-
-        default_dialogue = movie_dialogues_collection.find_one(
-            {
-                "movie_id": movie_id,
-                "is_default": True
-            }
-        )
-
-        if default_dialogue:
-
-            return {
-                "id": str(default_dialogue["_id"]),
-                "movie_id": movie_id,
-                "actor_id": default_dialogue["actor_id"],
-                "character": default_dialogue["character"],
-                "response": default_dialogue["dialogue"],
-                "source": "default",
-                "matched": False,
-                "match_type": "actor_not_in_movie",
-                "generation_queued": False,
-                "similarity": None
-            }
-
-        return {
-            "id": None,
-            "movie_id": movie_id,
-            "actor_id": actor_id,
-            "character": context.get("character"),
-            "response": (
-                "No default dialogue found for this movie."
-            ),
-            "source": "default",
-            "matched": False,
-            "match_type": "default_unavailable",
-            "generation_queued": False,
-            "similarity": None
-        }
-
-    # --------------------------------------------------
-    # 3. Build genre-aware criteria and vector
-    # --------------------------------------------------
+    # ==================================================
+    # 1. Build criteria and vector
+    # ==================================================
 
     criteria, preference_vector, vector_dimensions = (
         build_preference_vector(
@@ -348,9 +393,13 @@ def get_punchline(
         )
     )
 
-    # --------------------------------------------------
-    # 4. Build canonical profile key
-    # --------------------------------------------------
+    print(
+        f"[SERVICE] Criteria: {criteria}"
+    )
+
+    # ==================================================
+    # 2. Build profile key
+    # ==================================================
 
     profile_key = build_profile_key(
         movie_id=movie_id,
@@ -359,9 +408,13 @@ def get_punchline(
         criteria=criteria
     )
 
-    # --------------------------------------------------
-    # 5. Exact profile lookup
-    # --------------------------------------------------
+    print(
+        f"[SERVICE] Profile key: {profile_key}"
+    )
+
+    # ==================================================
+    # 3. Exact profile lookup
+    # ==================================================
 
     existing = punchlines_collection.find_one(
         {
@@ -369,11 +422,11 @@ def get_punchline(
         }
     )
 
-    # --------------------------------------------------
-    # 6. Exact match found
-    # --------------------------------------------------
-
     if existing:
+
+        print(
+            "[SERVICE] Exact profile match found."
+        )
 
         return format_result(
             document=existing,
@@ -384,9 +437,9 @@ def get_punchline(
             matched=True
         )
 
-    # --------------------------------------------------
-    # 7. Search similar profiles
-    # --------------------------------------------------
+    # ==================================================
+    # 4. Vector search
+    # ==================================================
 
     vector_pipeline = [
 
@@ -441,11 +494,11 @@ def get_punchline(
 
                 "profile_key": 1,
 
-                # New field
                 "response": 1,
 
-                # Keep compatibility with old documents
                 "punchline": 1,
+
+                "movie_punchline": 1,
 
                 "source": 1,
 
@@ -456,19 +509,25 @@ def get_punchline(
         }
     ]
 
-    # --------------------------------------------------
-    # 8. Execute vector search
-    # --------------------------------------------------
+    try:
 
-    similar_results = list(
-        punchlines_collection.aggregate(
-            vector_pipeline
+        similar_results = list(
+            punchlines_collection.aggregate(
+                vector_pipeline
+            )
         )
-    )
 
-    # --------------------------------------------------
-    # 9. Check best vector match
-    # --------------------------------------------------
+    except Exception as e:
+
+        print(
+            f"[SERVICE] Vector search failed: {e}"
+        )
+
+        similar_results = []
+
+    # ==================================================
+    # 5. Check vector similarity
+    # ==================================================
 
     if similar_results:
 
@@ -479,35 +538,46 @@ def get_punchline(
             0.0
         )
 
-        # --------------------------------------------------
-        # 10. Similarity >= 75%
-        #
-        # Reuse existing response.
-        # --------------------------------------------------
+        print(
+            "[SERVICE] Best similarity: "
+            f"{similarity_score}"
+        )
+
+        # ==================================================
+        # Similarity >= 75%
+        # ==================================================
 
         if similarity_score >= SIMILARITY_THRESHOLD:
 
-            # New documents use "response".
-            # Old documents may still use "punchline".
             matched_response = best_match.get(
                 "response"
             )
 
             if not matched_response:
+
                 matched_response = best_match.get(
                     "punchline"
                 )
 
             return {
-                "id": str(best_match["_id"]),
-                "movie_id": best_match["movie_id"],
-                "actor_id": best_match["actor_id"],
 
-                # Always use current request character
-                # when available.
+                "id": str(
+                    best_match["_id"]
+                ),
+
+                "movie_id": best_match[
+                    "movie_id"
+                ],
+
+                "actor_id": best_match[
+                    "actor_id"
+                ],
+
                 "character": context.get(
                     "character",
-                    best_match.get("character")
+                    best_match.get(
+                        "character"
+                    )
                 ),
 
                 "response": matched_response,
@@ -518,64 +588,96 @@ def get_punchline(
                 ),
 
                 "matched": True,
+
                 "match_type": "vector",
+
                 "generation_queued": False,
+
                 "similarity": similarity_score
             }
 
-    # --------------------------------------------------
-    # 11. No exact/suitable vector match
+    # ==================================================
+    # 6. No exact/vector match
     #
-    # We only use this to determine whether generation
-    # should be queued.
+    # IMPORTANT:
+    # We DO NOT check whether default exists before
+    # queuing Gemini.
     #
-    # The actual generated dialogue comes from Gemini.
-    # --------------------------------------------------
+    # Gemini must always get a chance to generate.
+    # ==================================================
 
-    default_dialogue = movie_dialogues_collection.find_one(
-        {
-            "movie_id": movie_id,
-            "is_default": True
-        }
+    print(
+        "[SERVICE] No exact/vector match."
     )
 
-    # --------------------------------------------------
-    # 12. Default dialogue found
+    # ==================================================
+    # 7. Get default dialogue
     #
-    # Queue Gemini generation.
-    # --------------------------------------------------
+    # Only used as immediate fallback while Gemini runs.
+    # ==================================================
+
+    default_dialogue = (
+        movie_dialogues_collection.find_one(
+            {
+                "movie_id": movie_id,
+                "is_default": True
+            }
+        )
+    )
+
+    # ==================================================
+    # 8. ALWAYS queue Gemini
+    # ==================================================
+
+    print(
+        "[SERVICE] Queueing Gemini generation..."
+    )
+
+    background_tasks.add_task(
+        generate_and_store_punchline,
+
+        movie_id,
+
+        actor_id,
+
+        genres,
+
+        user_preferences,
+
+        context
+    )
+
+    # ==================================================
+    # 9. Return immediate response
+    # ==================================================
 
     if default_dialogue:
 
-        background_tasks.add_task(
-            generate_and_store_punchline,
-            movie_id,
-            actor_id,
-            genres,
-            user_preferences,
-            context
+        print(
+            "[SERVICE] Returning default while "
+            "Gemini generates."
         )
 
-        # --------------------------------------------------
-        # Immediately return default dialogue
-        #
-        # This is the existing asynchronous behavior.
-        # The newly generated DIG + punchline will be
-        # available on a later request.
-        # --------------------------------------------------
-
         return {
-            "id": str(default_dialogue["_id"]),
+
+            "id": str(
+                default_dialogue["_id"]
+            ),
+
             "movie_id": movie_id,
 
             "actor_id": actor_id,
 
             "character": context.get(
                 "character",
-                default_dialogue.get("character")
+                default_dialogue.get(
+                    "character"
+                )
             ),
 
-            "response": default_dialogue["dialogue"],
+            "response": default_dialogue[
+                "dialogue"
+            ],
 
             "source": "default",
 
@@ -588,52 +690,91 @@ def get_punchline(
             "similarity": None
         }
 
-    # --------------------------------------------------
-    # 13. No default dialogue found
-    # --------------------------------------------------
+    # ==================================================
+    # 10. No default dialogue
+    #
+    # Gemini is STILL running.
+    # ==================================================
+
+    print(
+        "[SERVICE] No default dialogue."
+    )
 
     return {
+
         "id": None,
+
         "movie_id": movie_id,
+
         "actor_id": actor_id,
-        "character": context.get("character"),
-        "response": (
-            "No default dialogue found for this movie."
+
+        "character": context.get(
+            "character"
         ),
-        "source": "default",
+
+        "response": (
+            "Generating personalized response..."
+        ),
+
+        "source": "gemini",
+
         "matched": False,
-        "match_type": "default_unavailable",
-        "generation_queued": False,
+
+        "match_type": "generation",
+
+        "generation_queued": True,
+
         "similarity": None
     }
 
 
-# ======================================================
-# Helper Function
-# ======================================================
+# ==========================================================
+# FORMAT RESULT
+# ==========================================================
 
 def format_result(
-    document: dict,
+    document: Dict[str, Any],
     source: str,
     matched: bool
 ):
 
-    # New generated documents contain "response".
-    # Old documents may contain "punchline".
-    response = document.get("response")
+    response = document.get(
+        "response"
+    )
 
     if not response:
-        response = document.get("punchline")
+
+        response = document.get(
+            "punchline"
+        )
 
     return {
-        "id": str(document["_id"]),
-        "movie_id": document["movie_id"],
-        "actor_id": document["actor_id"],
-        "character": document.get("character"),
+
+        "id": str(
+            document["_id"]
+        ),
+
+        "movie_id": document[
+            "movie_id"
+        ],
+
+        "actor_id": document[
+            "actor_id"
+        ],
+
+        "character": document.get(
+            "character"
+        ),
+
         "response": response,
+
         "source": source,
+
         "matched": matched,
+
         "match_type": "exact",
+
         "generation_queued": False,
+
         "similarity": None
     }
